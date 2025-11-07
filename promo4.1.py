@@ -36,6 +36,7 @@ import sys
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 import tensorflow as tf
 from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.applications.efficientnet import preprocess_input
 from tensorflow.keras.layers import GlobalAveragePooling2D, Dense
 from tensorflow.keras.models import Model
 
@@ -114,34 +115,71 @@ def save_artifacts(
 # ------------------------------- CNN scorer -------------------------------
 
 class PromoCNN:
-    def __init__(self, img_size: int = 224, freeze_upto: int = -20):
-        base = EfficientNetB0(include_top=False, weights="imagenet", input_shape=(img_size, img_size, 3))
-        for l in base.layers[:freeze_upto]:
-            l.trainable = False
-        x = GlobalAveragePooling2D()(base.output)
-        embed = Dense(128, activation="relu", name="embed")(x)
-        out = Dense(1, activation="sigmoid", name="score")(embed)
-        self.model = Model(inputs=base.input, outputs=[out, embed])
+    """
+    EfficientNet-based feature extractor with memory-safe batched scoring.
+    The constructor uses EfficientNetB0 with global pooling to produce a compact
+    embedding for each frame. The scores(...) method processes frames in batches
+    and converts embeddings into a 0-1 score via min-max normalization of the
+    embedding L2 norms. This keeps behavior simple and avoids adding extra trainable layers.
+    """
+
+    def __init__(self, img_size: int = 224):
+        # EfficientNetB0 without top, with global average pooling to get compact embeddings
+        base = EfficientNetB0(include_top=False, weights="imagenet", pooling="avg", input_shape=(img_size, img_size, 3))
+        self.model = base  # model returns (batch, features)
         self.img_size = img_size
 
-    def _prep(self, bgr: np.ndarray) -> np.ndarray:
+    def _prep_single(self, bgr: np.ndarray) -> np.ndarray:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         rgb = cv2.resize(rgb, (self.img_size, self.img_size))
-        return (rgb.astype("float32") / 255.0)
+        arr = rgb.astype("float32")
+        arr = preprocess_input(arr)  # EfficientNet preprocessing
+        return arr
 
-    def scores(self, frames: List[np.ndarray]) -> np.ndarray:
+    def scores(self, frames: List[np.ndarray], batch_size: int = 16) -> np.ndarray:
+        """
+        Compute a per-frame scalar score for each frame in `frames`.
+        Processing is done in batches to avoid large memory spikes.
+        Returns a 1D numpy array of float32 scores in range [0,1].
+        """
         if not frames:
             return np.array([], dtype=np.float32)
-        batch = np.stack([self._prep(f) for f in frames], axis=0)
-        s, _ = self.model.predict(batch, verbose=0)
-        return s.reshape(-1).astype(np.float32)
+
+        # Prepare frames incrementally and run inference in batches
+        n = len(frames)
+        norms = []
+        i = 0
+        while i < n:
+            end = min(n, i + batch_size)
+            batch_frames = [self._prep_single(f) for f in frames[i:end]]
+            batch = np.stack(batch_frames, axis=0)
+            # predict embeddings
+            emb = self.model.predict(batch, verbose=0)
+            # compute L2 norm per embedding as a simple scalar signal
+            batch_norms = np.linalg.norm(emb, axis=1)
+            norms.extend(batch_norms.tolist())
+            i = end
+
+        norms = np.array(norms, dtype=np.float32)
+        if norms.size == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        # Normalize to 0-1 to get a pseudo-score
+        minv = float(norms.min())
+        maxv = float(norms.max())
+        rng = maxv - minv
+        if rng <= 1e-6:
+            scores = np.clip((norms - minv), 0.0, 1.0)
+        else:
+            scores = (norms - minv) / rng
+        return scores.astype(np.float32)
 
 
 # ----------------------------- core generator -----------------------------
 
 class PromoVideoGenerator:
     """
-    - Visual scoring: EfficientNetB0(sigmoid)
+    - Visual scoring: EfficientNetB0 embeddings -> L2 norm -> normalized score
     - Audio: RMS + onset (optional fusion)
     - Selection: peaks on smoothed CNN scores
     - Optional scene snapping via PySceneDetect
@@ -169,9 +207,8 @@ class PromoVideoGenerator:
 
     def _extract_visual_scores(self, video_path: Path, duration: float, progress_cb=None) -> np.ndarray:
         """
-        Extract visual frames sampled at self.fps_sample and compute CNN scores.
-        If progress_cb is provided, it will be called with a float in [0,1]
-        indicating progress over the frame sampling loop.
+        Memory-safe visual extraction with frame skipping and batched CNN inference.
+        progress_cb, if provided, will be called with values in [0,1].
         """
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -179,23 +216,28 @@ class PromoVideoGenerator:
             return np.ones(int(max(1, duration * self.fps_sample)), dtype=np.float32)
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        sample_every = max(1, int(fps // self.fps_sample))
-        total_frames = int(max(1, fps * duration))
-        expected_steps = max(1, total_frames // sample_every)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.get(cv2.CAP_PROP_FRAME_COUNT) else int(max(1, fps * duration))
 
-        frames: List[np.ndarray] = []
+        # sample_every controls sampling rate relative to video fps and desired fps_sample
+        sample_every = max(1, int(round(fps / float(self.fps_sample)))) if self.fps_sample > 0 else max(1, int(round(fps)))
+        # additional frame skipping factor to reduce memory on constrained hosts
+        # tune this if you need fewer frames; default keeps some sampling density
+        frame_skip = max(1, sample_every * 5)
+
+        frames_buffer: List[np.ndarray] = []
         idx = 0
-        count = 0
+        extracted = 0
+        expected = max(1, total_frames // frame_skip)
 
         ok, frame = cap.read()
         while ok:
-            if idx % sample_every == 0:
-                frames.append(frame)
-                count += 1
-                # update progress during frame collection
+            if idx % frame_skip == 0:
+                # keep original BGR frame for later preprocessing in PromoCNN
+                frames_buffer.append(frame)
+                extracted += 1
                 if progress_cb is not None:
                     try:
-                        progress_cb(min(1.0, count / expected_steps))
+                        progress_cb(min(0.5, extracted / expected * 0.5))  # up to 0.5 for frame collection
                     except Exception:
                         pass
             idx += 1
@@ -203,17 +245,29 @@ class PromoVideoGenerator:
 
         cap.release()
 
-        # compute scores (this may take time)
-        scores = self.cnn.scores(frames)
-        # final progress update for visual stage
+        if not frames_buffer:
+            return np.ones(int(max(1, duration * self.fps_sample)), dtype=np.float32)
+
+        # Compute scores in batches using PromoCNN.scores
+        # We will call scores in batches via the PromoCNN method which itself batches.
+        # Provide a small progress update before and after model inference.
         if progress_cb is not None:
             try:
-                progress_cb(0.6)  # signal that visual extraction is mostly done
+                progress_cb(0.5)
+            except Exception:
+                pass
+
+        scores = self.cnn.scores(frames_buffer, batch_size=8)
+
+        # indicate visual stage nearly finished
+        if progress_cb is not None:
+            try:
+                progress_cb(0.65)
             except Exception:
                 pass
 
         if scores.size == 0:
-            return np.ones(len(frames), dtype=np.float32)
+            return np.ones(len(frames_buffer), dtype=np.float32)
         return scores
 
     def _extract_audio_features(self, clip: VideoFileClip, duration: float) -> np.ndarray:
@@ -259,7 +313,7 @@ class PromoVideoGenerator:
         # if a progress callback exists, indicate audio+fusion will happen next
         if progress_cb is not None:
             try:
-                progress_cb(0.7)
+                progress_cb(0.75)
             except Exception:
                 pass
 
@@ -274,7 +328,7 @@ class PromoVideoGenerator:
         # signal near completion of feature extraction
         if progress_cb is not None:
             try:
-                progress_cb(0.85)
+                progress_cb(0.9)
             except Exception:
                 pass
 
@@ -385,7 +439,7 @@ class PromoVideoGenerator:
         # indicate scoring stage start
         if progress_cb is not None:
             try:
-                progress_cb(0.9)
+                progress_cb(0.95)
             except Exception:
                 pass
 
