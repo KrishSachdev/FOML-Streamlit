@@ -31,6 +31,7 @@ from tqdm import tqdm
 from moviepy.editor import VideoFileClip, concatenate_videoclips
 from sklearn.preprocessing import StandardScaler
 from scipy.signal import find_peaks
+import sys
 
 # TF quiet + imports
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -466,4 +467,106 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Avoid triggering CLI when running under Streamlit
+    if 'streamlit' not in sys.modules:
+        main()
+
+# ------------------------------ Streamlit UI ------------------------------
+
+def _render_streamlit_app() -> None:
+    import streamlit as st
+
+    st.set_page_config(page_title="Promo Video Generator", page_icon="🎬", layout="centered")
+    st.title("🎥 Automated Promo Video Generator (CNN)")
+    st.caption("Upload a source video, configure options, and generate a short promo.")
+
+    with st.sidebar:
+        st.header("Options")
+        target_duration = st.slider("Target duration (seconds)", min_value=10, max_value=120, value=30, step=5)
+        fps_sample = st.slider("Analysis FPS (samples/sec)", min_value=1, max_value=8, value=2, step=1)
+        scene_snap = st.toggle("Snap to scene boundaries", value=True, help="Uses PySceneDetect if available")
+        scene_threshold = st.slider("Scene threshold", min_value=5.0, max_value=40.0, value=27.0, step=1.0)
+        add_effects = st.toggle("Subtle effects (speed/fades)", value=True)
+        save_scores = st.toggle("Save artifacts (scores/segments)", value=False)
+        run_tag = st.text_input("Run tag", value="run")
+        out_dir = st.text_input("Artifacts output dir", value="eval_artifacts")
+        seed = st.number_input("Seed", min_value=0, value=123, step=1)
+
+    uploaded = st.file_uploader("Upload input video", type=["mp4", "mov", "mkv", "avi"])
+
+    if uploaded is not None:
+        st.video(uploaded)
+
+    col1, col2 = st.columns(2)
+    generate_clicked = col1.button("Generate Promo", type="primary", disabled=(uploaded is None))
+    reset_clicked = col2.button("Reset")
+
+    if reset_clicked:
+        st.experimental_rerun()
+
+    if generate_clicked and uploaded is not None:
+        try:
+            set_global_seeds(int(seed))
+
+            with st.status("Preparing input…", expanded=False) as status:
+                status.update(label="Saving uploaded video")
+                src_tmp = tempfile.NamedTemporaryFile(suffix=Path(uploaded.name).suffix, delete=False)
+                src_tmp.write(uploaded.read())
+                src_tmp.flush()
+                src_path = Path(src_tmp.name)
+                src_tmp.close()
+
+                status.update(label="Setting up generator")
+                gen = PromoVideoGenerator(
+                    target_duration=int(target_duration),
+                    fps_sample=int(fps_sample),
+                    scene_snap=bool(scene_snap),
+                    save_scores=bool(save_scores),
+                    run_tag=str(run_tag),
+                    out_dir=str(out_dir),
+                )
+
+            st.write("Generating promo — this can take a little time…")
+            progress = st.progress(0)
+
+            out_tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+            out_path = Path(out_tmp.name)
+            out_tmp.close()
+
+            # Run generation
+            gen.create_promo(
+                video_path=src_path,
+                output_path=out_path,
+                add_effects=bool(add_effects),
+                scene_threshold=float(scene_threshold),
+            )
+            progress.progress(100)
+
+            st.success("Promo generated!")
+            with out_path.open("rb") as f:
+                video_bytes = f.read()
+            st.video(video_bytes)
+            st.download_button(
+                label="Download Promo MP4",
+                data=video_bytes,
+                file_name="promo_output.mp4",
+                mime="video/mp4",
+            )
+
+            # Cleanup temp source file to save space
+            try:
+                src_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        except Exception as e:
+            st.error(f"Failed to generate promo: {e}")
+
+
+# Render UI when executed by Streamlit
+try:
+    import streamlit as _st  # noqa: F401
+    _render_streamlit_app()
+except Exception:
+    # Not running under Streamlit or import failed; ignore UI path.
+    pass
