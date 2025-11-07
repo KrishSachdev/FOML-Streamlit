@@ -7,7 +7,7 @@ a semantic visual score from a pretrained model.
 
 INSTALL (CPU is fine):
 ---------------------
-pip install moviepy opencv-python librosa numpy scipy scikit-learn pillow tqdm imageio-ffmpeg tensorflow
+pip install moviepy opencv-python-headless librosa numpy scipy scikit-learn pillow imageio-ffmpeg tensorflow
 # for scene-aware cuts:
 pip install scenedetect[opencv]
 
@@ -27,7 +27,6 @@ from typing import List, Tuple, Iterable
 
 import numpy as np
 import librosa
-from tqdm import tqdm
 from moviepy.editor import VideoFileClip, concatenate_videoclips
 from sklearn.preprocessing import StandardScaler
 from scipy.signal import find_peaks
@@ -100,7 +99,7 @@ def save_artifacts(
     out_dir.mkdir(parents=True, exist_ok=True)
     if scores is not None:
         np.save(out_dir / f"scores_{run_tag}_{base_stem}.npy", scores)
-        log(f"💾 Saved per-sample scores to: {out_dir / f'scores_{run_tag}_{base_stem}.npy'}")
+        log(f"Saved per-sample scores to: {out_dir / f'scores_{run_tag}_{base_stem}.npy'}")
     if segs is not None:
         import csv
         path = out_dir / f"segments_{run_tag}_{base_stem}.csv"
@@ -109,7 +108,7 @@ def save_artifacts(
             w.writerow(["start_sec", "end_sec"])
             for s, e in segs:
                 w.writerow([round(float(s), 3), round(float(e), 3)])
-        log(f"💾 Saved selected segments to: {path}")
+        log(f"Saved selected segments to: {path}")
 
 
 # ------------------------------- CNN scorer -------------------------------
@@ -168,10 +167,15 @@ class PromoVideoGenerator:
 
     # ------------------------------ features ------------------------------
 
-    def _extract_visual_scores(self, video_path: Path, duration: float) -> np.ndarray:
+    def _extract_visual_scores(self, video_path: Path, duration: float, progress_cb=None) -> np.ndarray:
+        """
+        Extract visual frames sampled at self.fps_sample and compute CNN scores.
+        If progress_cb is provided, it will be called with a float in [0,1]
+        indicating progress over the frame sampling loop.
+        """
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            log("⚠️  Could not open video for visual CNN analysis; using flat scores.")
+            log("Could not open video for visual CNN analysis; using flat scores.")
             return np.ones(int(max(1, duration * self.fps_sample)), dtype=np.float32)
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -180,22 +184,37 @@ class PromoVideoGenerator:
         expected_steps = max(1, total_frames // sample_every)
 
         frames: List[np.ndarray] = []
-        pbar = tqdm(total=expected_steps, desc="Visual (CNN)")
-
         idx = 0
+        count = 0
+
         ok, frame = cap.read()
         while ok:
             if idx % sample_every == 0:
                 frames.append(frame)
-                pbar.update(1)
+                count += 1
+                # update progress during frame collection
+                if progress_cb is not None:
+                    try:
+                        progress_cb(min(1.0, count / expected_steps))
+                    except Exception:
+                        pass
             idx += 1
             ok, frame = cap.read()
 
         cap.release()
-        pbar.close()
 
-        s = self.cnn.scores(frames)
-        return s if s.size else np.ones(len(frames), dtype=np.float32)
+        # compute scores (this may take time)
+        scores = self.cnn.scores(frames)
+        # final progress update for visual stage
+        if progress_cb is not None:
+            try:
+                progress_cb(0.6)  # signal that visual extraction is mostly done
+            except Exception:
+                pass
+
+        if scores.size == 0:
+            return np.ones(len(frames), dtype=np.float32)
+        return scores
 
     def _extract_audio_features(self, clip: VideoFileClip, duration: float) -> np.ndarray:
         if clip.audio is None:
@@ -228,24 +247,39 @@ class PromoVideoGenerator:
         except Exception:
             return np.zeros((int(max(1, duration * self.fps_sample)), 2), dtype=np.float32)
 
-    def extract_features(self, video_path: Path) -> Tuple[np.ndarray, float]:
-        log("📊 Extracting features with CNN + Audio (no PCA)...")
+    def extract_features(self, video_path: Path, progress_cb=None) -> Tuple[np.ndarray, float]:
+        log("Extracting features with CNN + Audio (no PCA)...")
         # Open once and reuse duration/audio
         with VideoFileClip(str(video_path)) as probe:
             duration = float(probe.duration)
             audio_feats = self._extract_audio_features(probe, duration)
 
-        vis_scores = self._extract_visual_scores(video_path, duration)
+        vis_scores = self._extract_visual_scores(video_path, duration, progress_cb=progress_cb)
+
+        # if a progress callback exists, indicate audio+fusion will happen next
+        if progress_cb is not None:
+            try:
+                progress_cb(0.7)
+            except Exception:
+                pass
 
         m = min(len(vis_scores), len(audio_feats))
         if m == 0:
-            log("⚠️  Not enough features; using flat scores.")
+            log("Not enough features; using flat scores.")
             return np.ones((max(len(vis_scores), len(audio_feats), 1), 1), dtype=np.float32), duration
 
         fused = np.column_stack([vis_scores[:m], audio_feats[:m]])  # [cnn, rms, onset]
         fused_norm = self.scaler.fit_transform(fused)
-        log("✅ Time steps:", fused_norm.shape[0])
-        log("🧠 Features per step: cnn_score + audio(2) =", fused_norm.shape[1])
+
+        # signal near completion of feature extraction
+        if progress_cb is not None:
+            try:
+                progress_cb(0.85)
+            except Exception:
+                pass
+
+        log("Time steps:", fused_norm.shape[0])
+        log("Features per step: cnn_score + audio(2) =", fused_norm.shape[1])
         return fused_norm.astype(np.float32), duration
 
     # ----------------------------- scoring + scenes -----------------------------
@@ -294,9 +328,9 @@ class PromoVideoGenerator:
     # ------------------------------ selection ------------------------------
 
     def select_segments(self, scores: np.ndarray, video_duration: float) -> List[Tuple[float, float]]:
-        log("✂️  Selecting optimal segments...")
+        log("Selecting optimal segments...")
         if video_duration <= self.target_duration:
-            log("⚠️  Video shorter than target; using full video")
+            log("Video shorter than target; using full video")
             return [(0.0, float(video_duration))]
 
         prom = max(0.15, float(scores.std()) * 0.5)
@@ -304,7 +338,7 @@ class PromoVideoGenerator:
         peaks, _ = find_peaks(scores, prominence=prom, distance=dist)
 
         if peaks.size == 0:
-            log("⚠️  No peaks found; using top values directly")
+            log("No peaks found; using top values directly")
             k = max(3, int(self.target_duration / 5))
             peaks = np.argsort(scores)[-k:]
             peaks.sort()
@@ -337,15 +371,24 @@ class PromoVideoGenerator:
         output_path: str | Path,
         add_effects: bool = True,
         scene_threshold: float = 27.0,
+        progress_cb=None,
     ) -> None:
         video_path = Path(video_path)
         output_path = Path(output_path)
         base_stem = video_path.stem
 
-        log("\n🎬 Starting promo generation (CNN)…")
+        log("\nStarting promo generation (CNN)…")
         log("=" * 60)
 
-        feats, duration = self.extract_features(video_path)
+        feats, duration = self.extract_features(video_path, progress_cb=progress_cb)
+
+        # indicate scoring stage start
+        if progress_cb is not None:
+            try:
+                progress_cb(0.9)
+            except Exception:
+                pass
+
         scores = self.score_signal(feats)
         if self.save_scores:
             save_artifacts(self.out_dir, self.run_tag, base_stem, scores, None)
@@ -354,11 +397,11 @@ class PromoVideoGenerator:
         bounds = self.detect_scene_bounds(video_path, threshold=scene_threshold)
         if bounds:
             segs = self._snap_to_scenes(segs, bounds)
-            log(f"🎞️  Snapped to {len(bounds)} detected scenes.")
+            log(f"Snapped to {len(bounds)} detected scenes.")
         if self.save_scores:
             save_artifacts(self.out_dir, self.run_tag, base_stem, None, segs)
 
-        log("\n🎞️  Assembling clips…")
+        log("\nAssembling clips…")
         clips = []
         with VideoFileClip(str(video_path)) as vid:
             for i, (a, b) in enumerate(segs):
@@ -370,17 +413,17 @@ class PromoVideoGenerator:
                         clip = clip.crossfadein(0.3).crossfadeout(0.3)
                     clips.append(clip)
                 except Exception as e:
-                    log(f"⚠️  Skipping segment {i+1}: {e}")
+                    log(f"Skipping segment {i+1}: {e}")
 
             if not clips:
                 raise ValueError("No valid clips could be extracted")
 
-            log(f"🔗 Concatenating {len(clips)} clips…")
+            log(f"Concatenating {len(clips)} clips…")
             final = concatenate_videoclips(clips, method="compose")
             if final.duration > self.target_duration:
                 final = final.subclip(0, self.target_duration)
 
-            log("\n💾 Rendering final promo (secs):", round(final.duration, 1))
+            log("\nRendering final promo (secs):", round(final.duration, 1))
             final.write_videofile(
                 str(output_path),
                 codec="libx264",
@@ -394,14 +437,21 @@ class PromoVideoGenerator:
                 logger=None,
             )
 
+        # final progress update
+        if progress_cb is not None:
+            try:
+                progress_cb(1.0)
+            except Exception:
+                pass
+
         log("\n" + "=" * 60)
-        log("✨ SUCCESS! Promo saved to:", str(output_path))
+        log("SUCCESS! Promo saved to:", str(output_path))
         log("=" * 60)
         try:
             size_mb = output_path.stat().st_size / (1024 * 1024.0)
         except Exception:
             size_mb = -1.0
-        log("📊 Stats")
+        log("Stats")
         log(" - Original duration (s):", round(duration, 1))
         log(" - Promo duration (s):   ", round(min(self.target_duration, duration), 1))
         log(" - Compression ratio:    ", round(duration / max(1e-6, min(self.target_duration, duration)), 1))
@@ -432,13 +482,13 @@ def main() -> None:
     args = parse_args()
     in_path = Path(args.input)
     if not in_path.exists():
-        log("❌ Error: Input file not found:", str(in_path))
+        log("Error: Input file not found:", str(in_path))
         return
 
     set_global_seeds(args.seed)
 
     log("\n" + "=" * 60)
-    log("🎥 AUTOMATED PROMO VIDEO GENERATOR (CNN)")
+    log("AUTOMATED PROMO VIDEO GENERATOR (CNN)")
     log("=" * 60)
     log("Input:", str(in_path))
     log("Output:", args.output)
@@ -447,7 +497,7 @@ def main() -> None:
     log("Scene Snapping:", "ON" if not args.no_scene_snap else "OFF", "(PySceneDetect)" if _SCENEDETECT_OK else "(Unavailable)")
     log("Scene Threshold:", args.scene_threshold)
     log("Seed:", args.seed)
-    log("Save Artifacts:", "ON" if args.save_scores else "OFF", "→", args.out_dir)
+    log("Save Artifacts:", "ON" if args.save_scores else "OFF", "->", args.out_dir)
     log("=" * 60 + "\n")
 
     gen = PromoVideoGenerator(
@@ -477,17 +527,17 @@ def _render_streamlit_app() -> None:
     import streamlit as st
 
     st.set_page_config(page_title="Promo Video Generator", page_icon="🎬", layout="centered")
-    st.title("🎥 Automated Promo Video Generator (CNN)")
+    st.title("Automated Promo Video Generator (CNN)")
     st.caption("Upload a source video, configure options, and generate a short promo.")
 
     with st.sidebar:
         st.header("Options")
         target_duration = st.slider("Target duration (seconds)", min_value=10, max_value=120, value=30, step=5)
         fps_sample = st.slider("Analysis FPS (samples/sec)", min_value=1, max_value=8, value=2, step=1)
-        scene_snap = st.toggle("Snap to scene boundaries", value=True, help="Uses PySceneDetect if available")
+        scene_snap = st.checkbox("Snap to scene boundaries", value=True)
         scene_threshold = st.slider("Scene threshold", min_value=5.0, max_value=40.0, value=27.0, step=1.0)
-        add_effects = st.toggle("Subtle effects (speed/fades)", value=True)
-        save_scores = st.toggle("Save artifacts (scores/segments)", value=False)
+        add_effects = st.checkbox("Subtle effects (speed/fades)", value=True)
+        save_scores = st.checkbox("Save artifacts (scores/segments)", value=False)
         run_tag = st.text_input("Run tag", value="run")
         out_dir = st.text_input("Artifacts output dir", value="eval_artifacts")
         seed = st.number_input("Seed", min_value=0, value=123, step=1)
@@ -533,14 +583,14 @@ def _render_streamlit_app() -> None:
             out_path = Path(out_tmp.name)
             out_tmp.close()
 
-            # Run generation
+            # Run generation with progress callback
             gen.create_promo(
                 video_path=src_path,
                 output_path=out_path,
                 add_effects=bool(add_effects),
                 scene_threshold=float(scene_threshold),
+                progress_cb=lambda p: progress.progress(int(max(0, min(100, p * 100))))
             )
-            progress.progress(100)
 
             st.success("Promo generated!")
             with out_path.open("rb") as f:
